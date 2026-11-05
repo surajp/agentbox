@@ -1,0 +1,225 @@
+#!/usr/bin/env bash
+# agentbox: run a coding agent inside an Apple `container` VM that can only see
+# the current project directory. Requires Apple container >= 1.6.
+#
+#   agentbox                 claude in the current dir (permissions skipped: the VM is the sandbox)
+#   agentbox claude [args]   same, with extra claude args
+#   agentbox shell           interactive bash in the box
+#   agentbox run CMD...      run any command in the box
+#   agentbox build [--no-cache --pull]   (re)build the image; both flags to update claude
+#   agentbox clean           force-remove leaked agentbox VMs
+#
+# Runs only inside ~/projects/<name> or /tmp/<name> (or below).
+# Env overrides: AGENTBOX_IMAGE AGENTBOX_DNS AGENTBOX_CPUS AGENTBOX_MEM AGENTBOX_DATA
+set -euo pipefail
+
+SELF_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+IMAGE="${AGENTBOX_IMAGE:-agentbox:latest}"
+DNS="${AGENTBOX_DNS:-1.1.1.1}"   # explicit: the vmnet gateway's DNS refuses queries on some Macs
+CPUS="${AGENTBOX_CPUS:-4}"
+MEM="${AGENTBOX_MEM:-8G}"
+DATA="${AGENTBOX_DATA:-$HOME/.local/share/agentbox}"  # NOT your real ~
+SHARED="$DATA/shared"   # login + default settings, shared by all project homes
+WORKSPACE="$(pwd -P)"
+
+die() { echo "agentbox: $*" >&2; exit 1; }
+warn() { printf '\033[1;31magentbox: %s\033[0m\n' "$*" >&2; }
+
+ensure_system() {
+  container system status >/dev/null 2>&1 || container system start >/dev/null
+}
+
+cmd_build() {  # extra args go to `container build`, e.g. --no-cache --pull
+  ensure_system
+  container build "$@" --dns "$DNS" -t "$IMAGE" \
+    --build-arg UID="$(id -u)" --build-arg GID="$(id -g)" \
+    -f "$SELF_DIR/Containerfile" "$SELF_DIR"
+}
+
+cmd_clean() {
+  local ids
+  ids=$(container ls -a 2>/dev/null | awk 'NR>1 && $1 ~ /^agentbox-/ {print $1}')
+  [[ -z "$ids" ]] && { echo "nothing to clean"; return; }
+  echo "$ids" | xargs container rm -f >/dev/null && echo "removed:" $ids
+}
+
+# --- Guardrail: where the box may run ---------------------------------------
+# Allowlist, not denylist: only a single project under ~/projects or /tmp.
+# That keeps out $HOME, ~/.ssh, ~/.aws, and ~/projects itself (= every repo).
+# Sets PROJECT_ROOT to ~/projects/<name> or /tmp/<name>.
+resolve_project_root() {
+  local projects base rel
+  projects="$(cd "$HOME/projects" 2>/dev/null && pwd -P)" || projects=""
+  # /private/tmp: macOS /tmp is a symlink and pwd -P resolves it.
+  for base in ${projects:+"$projects"} /private/tmp /tmp; do
+    case "$WORKSPACE/" in
+      "$base"/?*/*)
+        rel="${WORKSPACE#"$base"/}"
+        PROJECT_ROOT="$base/${rel%%/*}"
+        return 0 ;;
+    esac
+  done
+  die "refusing to run in $WORKSPACE: only ~/projects/<name> or /tmp/<name> (or below) are allowed."
+}
+
+# --- Per-project agent home ---------------------------------------------------
+# Each project gets its own home, so its transcripts, history and memory
+# (~/.claude/projects, history.jsonl, ...) are invisible to other projects.
+# Only the login is shared: copied in before the run, copied back if refreshed.
+# settings.json flows shared -> project ONLY: syncing it back would let one
+# project plant hooks that run in every other project's box.
+
+copy_if_newer() {  # src dst
+  if [[ -f $1 && ( ! -f $2 || $1 -nt $2 ) ]]; then cp -p "$1" "$2"; fi
+}
+
+# Onboarding/account state, without the per-project bits of .claude.json.
+make_claude_json_template() {  # src dst
+  command -v jq >/dev/null || return 0
+  (umask 077; jq '{hasCompletedOnboarding, lastOnboardingVersion, oauthAccount,
+      userID, machineID, firstStartTime, migrationVersion, lastReleaseNotesSeen,
+      opusProMigrationComplete, sonnet1m45MigrationComplete}
+    | with_entries(select(.value != null))' "$1" > "$2.tmp") && mv "$2.tmp" "$2"
+}
+
+# One-time move from the old single shared home ($DATA/home).
+migrate_legacy_home() {
+  local old="$DATA/home"
+  [[ -d $old && ! -d $SHARED ]] || return 0
+  (umask 077; mkdir -p "$SHARED")
+  copy_if_newer "$old/.claude/.credentials.json" "$SHARED/credentials.json"
+  copy_if_newer "$old/.claude/settings.json" "$SHARED/settings.json"
+  [[ -f $old/.claude.json ]] && make_claude_json_template "$old/.claude.json" "$SHARED/claude.json"
+  warn "moved login to per-project homes. $old still holds transcripts from ALL projects;"
+  warn "delete it when you're happy:  rm -rf '$old'"
+}
+
+prepare_home() {
+  local key
+  key="$(basename "$PROJECT_ROOT" | tr -c 'a-zA-Z0-9._\n-' '-')-$(printf %s "$PROJECT_ROOT" | shasum | cut -c1-8)"
+  AGENT_HOME="$DATA/homes/$key"
+  migrate_legacy_home
+  (umask 077; mkdir -p "$SHARED" "$AGENT_HOME/.claude")
+  copy_if_newer "$SHARED/credentials.json" "$AGENT_HOME/.claude/.credentials.json"
+  copy_if_newer "$SHARED/settings.json" "$AGENT_HOME/.claude/settings.json"
+  if [[ ! -f $AGENT_HOME/.claude.json && -f $SHARED/claude.json ]]; then
+    cp -p "$SHARED/claude.json" "$AGENT_HOME/.claude.json"
+  fi
+}
+
+sync_home_back() {
+  copy_if_newer "$AGENT_HOME/.claude/.credentials.json" "$SHARED/credentials.json"
+  if [[ ! -f $SHARED/claude.json && -f $AGENT_HOME/.claude.json ]]; then
+    make_claude_json_template "$AGENT_HOME/.claude.json" "$SHARED/claude.json"
+  fi
+}
+
+# --- Host-execution guard -------------------------------------------------------
+# git hooks and repo config (core.fsmonitor, core.hooksPath, [include], jj
+# aliases/tools...) execute on the HOST the next time you run git/jj there.
+# The top-level .git/hooks and .git/config are mounted read-only; everything
+# else that can do this (nested repos, submodules, worktrees, .jj) is
+# snapshotted before the run and diffed after.
+guard_snapshot() {  # one "path<TAB>fingerprint" line per watched entry
+  local f files=()
+  while IFS= read -r f; do
+    if [[ -L $f ]]; then printf '%s\tlink:%s\n' "$f" "$(readlink "$f")"
+    elif [[ -f $f ]]; then files+=("$f")
+    else printf '%s\tdir\n' "$f"; fi
+  done < <(find "$WORKSPACE" \
+      \( -name node_modules -o -path '*/.git/objects' -o -path '*/.git/modules/*/objects' \
+         -o -path '*/.jj/repo/store/git/objects' -o -path '*/.jj/repo/op_store' \) -prune -o \
+      \( -name .git -o -path '*/.git/hooks*' -o -path '*/.git/config*' \
+         -o -path '*/.git/modules/*/config' -o -path '*/.git/modules/*/hooks*' \
+         -o -path '*/.git/worktrees/*/config*' \
+         -o -name .jj -o -path '*/.jj/repo' -o -path '*/.jj/repo/config.toml' \
+         -o -path '*/.jj/repo/store/git/config' -o -path '*/.jj/repo/store/git/hooks*' \) \
+      ! -name '*.sample' -print 2>/dev/null)   # git never runs *.sample hooks
+  if ((${#files[@]})); then
+    shasum -a 256 "${files[@]}" | awk '{h=$1; sub(/^[^ ]+ [ *]/, ""); print $0 "\t" h}'
+  fi
+}
+
+guard_check() {
+  local changes
+  changes="$(awk -F'\t' -v ws="$WORKSPACE/" '
+    function rel(p) { return index(p, ws) == 1 ? substr(p, length(ws) + 1) : p }
+    !NF     { next }
+    NR==FNR { before[$1]=$2; next }
+    !($1 in before)    { print "  added:   " rel($1) }
+    ($1 in before) && before[$1] != $2 { print "  changed: " rel($1) }
+    { delete before[$1] }
+    END { for (p in before) print "  removed: " rel(p) }' \
+    <(printf '%s\n' "$GUARD_BEFORE") <(guard_snapshot) | LC_ALL=C sort)"
+  [[ -z $changes ]] && return 0
+  warn "git/jj hooks or config changed during this session. These run on your Mac,"
+  warn "OUTSIDE the sandbox. Review them before running git/jj in $WORKSPACE:"
+  printf '%s\n' "$changes" >&2
+}
+
+readonly_mounts() {  # appends to the caller's `args`
+  local w="$WORKSPACE"
+  if [[ -d $w/.git && ! -L $w/.git ]]; then
+    [[ -e $w/.git/hooks || -L $w/.git/hooks ]] || mkdir "$w/.git/hooks"
+    if [[ -d $w/.git/hooks && ! -L $w/.git/hooks ]]; then args+=(-v "$w/.git/hooks:$w/.git/hooks:ro"); fi
+    if [[ -f $w/.git/config && ! -L $w/.git/config ]]; then args+=(-v "$w/.git/config:$w/.git/config:ro"); fi
+  fi
+  local jjc="$w/.jj/repo/config.toml"
+  if [[ ! -L $w/.jj && ! -L $w/.jj/repo && -f $jjc && ! -L $jjc ]]; then args+=(-v "$jjc:$jjc:ro"); fi
+}
+
+on_exit() {
+  # If we're killed (e.g. terminal closed -> SIGHUP), remove the VM: --rm only
+  # fires when the container exits on its own, not when the CLI client dies.
+  container rm -f "$BOX_NAME" >/dev/null 2>&1 || true
+  sync_home_back || true
+  guard_check || true
+}
+
+run_in_box() {
+  resolve_project_root
+  ensure_system
+  container image inspect "$IMAGE" >/dev/null 2>&1 || cmd_build
+  prepare_home
+
+  # Globals on purpose: the EXIT trap runs after this function returns, when locals are gone.
+  BOX_NAME="agentbox-$(basename "$WORKSPACE" | tr -c 'a-zA-Z0-9-\n' '-')-$$"
+  GUARD_BEFORE="$(guard_snapshot)"
+  local args=(run --rm --name "$BOX_NAME" --label agentbox=1 --progress none
+    --init                              # real PID 1: forwards signals, reaps zombies
+    --cap-drop ALL                      # agent needs no Linux capabilities
+    --cpus "$CPUS" --memory "$MEM" --dns "$DNS"
+    -v "$WORKSPACE:$WORKSPACE"          # same path inside & out: clickable paths, stable agent memory
+    -v "$AGENT_HOME:/home/agent"        # this project's own persistent agent home
+    -w "$WORKSPACE"
+    -e TERM="${TERM:-xterm-256color}")
+  readonly_mounts                       # must come after the workspace mount
+  local k v
+  for k in NAME EMAIL; do
+    v="$(git config "user.$(tr '[:upper:]' '[:lower:]' <<<"$k")" 2>/dev/null || true)"
+    if [[ -n $v ]]; then args+=(-e "GIT_AUTHOR_$k=$v" -e "GIT_COMMITTER_$k=$v"); fi
+  done
+  # Opt-in secret passthrough: only forwarded if you set it on the host.
+  [[ -n "${ANTHROPIC_API_KEY:-}" ]] && args+=(-e ANTHROPIC_API_KEY)
+  if [[ -t 0 && -t 1 ]]; then args+=(-it); else args+=(-i); fi
+
+  trap on_exit EXIT
+  trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM
+  # Background + wait, because bash defers traps until a *foreground* child
+  # exits, while `wait` is interruptible. `<&0` stops bash from silently
+  # redirecting a background job's stdin to /dev/null (interactive use needs it).
+  container "${args[@]}" "$IMAGE" "$@" <&0 &
+  local rc=0
+  wait $! || rc=$?
+  return "$rc"
+}
+
+case "${1:-claude}" in
+  build)  shift; cmd_build "$@" ;;
+  clean)  cmd_clean ;;
+  shell)  run_in_box bash -l ;;
+  run)    shift; [[ $# -gt 0 ]] || die "usage: agentbox run CMD..."; run_in_box "$@" ;;
+  claude) [[ $# -gt 0 ]] && shift; run_in_box claude --dangerously-skip-permissions "$@" ;;
+  -h|--help|help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *)      die "unknown command: $1 (try --help)" ;;
+esac
