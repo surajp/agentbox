@@ -9,6 +9,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 python3-venv python3-pip build-essential openssh-client \
     && rm -rf /var/lib/apt/lists/*
 
+# Jujutsu (jj) isn't packaged for bookworm, so install the static musl build
+# from GitHub releases, pinned by version and checksum.
+ARG JJ_VERSION=0.47.1
+RUN set -eu; \
+    case "$(dpkg --print-architecture)" in \
+        arm64) arch=aarch64; sha=0f300e1576de8dabe0a9dedf0b87ae44f8accea5cf54d9a342a51061c1fb1bcd ;; \
+        amd64) arch=x86_64;  sha=d4b657f622ee50929c8916466dfa3d6a6c17a0a32b50e7b2c793707ec9ebcad7 ;; \
+        *) echo "unsupported arch for jj" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /tmp/jj.tar.gz \
+        "https://github.com/jj-vcs/jj/releases/download/v${JJ_VERSION}/jj-v${JJ_VERSION}-${arch}-unknown-linux-musl.tar.gz"; \
+    echo "${sha}  /tmp/jj.tar.gz" | sha256sum -c -; \
+    tar -xzf /tmp/jj.tar.gz -C /usr/local/bin ./jj; \
+    rm /tmp/jj.tar.gz; \
+    jj --version
+
 # Install agents globally under /usr/local, NOT in $HOME:
 # /home/agent is replaced by a host bind mount at runtime and would hide them.
 RUN npm install -g @anthropic-ai/claude-code && npm cache clean --force
@@ -31,6 +47,7 @@ RUN git config --system --add safe.directory '*'
 USER agent
 ENV HOME=/home/agent \
     PATH=/home/agent/.local/bin:/usr/local/bin:/usr/bin:/bin \
-    IS_SANDBOX=1
+    IS_SANDBOX=1 \
+    TERM=xterm-256color
 WORKDIR /workspace
 CMD ["bash"]

@@ -107,4 +107,4 @@ network blocks public DNS, point `AGENTBOX_DNS` at your LAN resolver in your she
 ## Files
 
 - `agentbox`: the CLI wrapper (bash)
-- `Containerfile`: the VM image (Debian + Node 22, git, ripgrep, python3, build tools, Claude Code)
+- `Containerfile`: the VM image (Debian + Node 22, git, jj, ripgrep, python3, build tools, Claude Code)
