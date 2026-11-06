@@ -50,6 +50,7 @@ VM that sees only the current project. Because the VM is the sandbox, Claude run
     agentbox build           # (re)build the image
     agentbox build --no-cache --pull   # rebuild from scratch: updates Claude Code and the base image
     agentbox clean           # force-remove leaked agentbox VMs
+    agentbox prune           # delete old agentbox images and dangling layers left by rebuilds
 
 Each invocation boots a fresh VM and removes it when the command exits, including on Ctrl-C,
 SIGTERM and closing the terminal.

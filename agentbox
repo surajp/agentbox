@@ -8,6 +8,7 @@
 #   agentbox run CMD...      run any command in the box
 #   agentbox build [--no-cache --pull]   (re)build the image; both flags to update claude
 #   agentbox clean           force-remove leaked agentbox VMs
+#   agentbox prune           delete old agentbox images + all dangling image layers
 #
 # Runs only inside ~/projects/<name> or /tmp/<name> (or below).
 # Env overrides: AGENTBOX_IMAGE AGENTBOX_DNS AGENTBOX_CPUS AGENTBOX_MEM AGENTBOX_DATA
@@ -41,6 +42,25 @@ cmd_clean() {
   ids=$(container ls -a 2>/dev/null | awk 'NR>1 && $1 ~ /^agentbox-/ {print $1}')
   [[ -z "$ids" ]] && { echo "nothing to clean"; return; }
   echo "$ids" | xargs container rm -f >/dev/null && echo "removed:" $ids
+}
+
+# Old builds: agentbox tags other than $IMAGE (e.g. the pre-rename `agentbox:latest`),
+# plus the untagged layers each rebuild leaves behind. `container image prune`
+# without --all only removes dangling (untagged) images, so other tagged images survive.
+cmd_prune() {
+  ensure_system
+  command -v jq >/dev/null || die "prune needs jq"
+  local current old
+  current="$(container image inspect "$IMAGE" 2>/dev/null | jq -r '.[0].configuration.name // empty')" || current=""
+  old="$(container image list --format json | jq -r --arg cur "${current:-$IMAGE}" '
+    .[].configuration.name
+    | select(test("^((localhost|docker\\.io/library)/)?agentbox(:|@)") and . != $cur)')"
+  if [[ -n $old ]]; then
+    echo "$old" | xargs container image rm >/dev/null && echo "removed images:" $old
+  else
+    echo "no old agentbox tags"
+  fi
+  container image prune
 }
 
 # --- Guardrail: where the box may run ---------------------------------------
@@ -283,9 +303,10 @@ run_in_box() {
 case "${1:-claude}" in
   build)  shift; cmd_build "$@" ;;
   clean)  cmd_clean ;;
+  prune)  cmd_prune ;;
   shell)  run_in_box bash -l ;;
   run)    shift; [[ $# -gt 0 ]] || die "usage: agentbox run CMD..."; run_in_box "$@" ;;
   claude) [[ $# -gt 0 ]] && shift; run_in_box claude --dangerously-skip-permissions "$@" ;;
-  -h|--help|help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//' ;;
+  -h|--help|help) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//' ;;
   *)      die "unknown command: $1 (try --help)" ;;
 esac
