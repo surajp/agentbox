@@ -14,7 +14,7 @@
 set -euo pipefail
 
 SELF_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
-IMAGE="${AGENTBOX_IMAGE:-agentbox:latest}"
+IMAGE="${AGENTBOX_IMAGE:-localhost/agentbox:latest}"  # explicit host: never resolves to Docker Hub
 DNS="${AGENTBOX_DNS:-1.1.1.1}"   # explicit: the vmnet gateway's DNS refuses queries on some Macs
 CPUS="${AGENTBOX_CPUS:-4}"
 MEM="${AGENTBOX_MEM:-8G}"

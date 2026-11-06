@@ -61,7 +61,7 @@ SIGTERM and closing the terminal.
 | `AGENTBOX_DNS`    | `1.1.1.1`                    | DNS server for builds and VMs               |
 | `AGENTBOX_CPUS`   | `4`                          | CPUs per VM                                 |
 | `AGENTBOX_MEM`    | `8G`                         | Memory per VM                               |
-| `AGENTBOX_IMAGE`  | `agentbox:latest`            | Image name                                  |
+| `AGENTBOX_IMAGE`  | `localhost/agentbox:latest`  | Image name                                  |
 | `AGENTBOX_DATA`   | `~/.local/share/agentbox`    | Agent homes and shared login                |
 
 DNS is always passed explicitly because the vmnet gateway's DNS refuses queries on some Macs. If your
