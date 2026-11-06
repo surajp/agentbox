@@ -117,8 +117,10 @@ sync_home_back() {
 # --- Host-execution guard -------------------------------------------------------
 # git hooks and repo config (core.fsmonitor, core.hooksPath, [include], jj
 # aliases/tools...) execute on the HOST the next time you run git/jj there.
-# The top-level .git/hooks and .git/config are mounted read-only; everything
-# else that can do this (nested repos, submodules, worktrees, .jj) is
+# The top-level .git/hooks, .git/config and jj's repo config are mounted
+# read-only, with their parent dirs pinned so they can't be renamed away (see
+# readonly_mounts). A .git/commondir the agent creates is quarantined on exit.
+# Everything else that can do this (nested repos, submodules, worktrees) is
 # snapshotted before the run and diffed after.
 guard_snapshot() {  # one "path<TAB>fingerprint" line per watched entry
   local f files=()
@@ -130,10 +132,13 @@ guard_snapshot() {  # one "path<TAB>fingerprint" line per watched entry
       \( -name node_modules -o -path '*/.git/objects' -o -path '*/.git/modules/*/objects' \
          -o -path '*/.jj/repo/store/git/objects' -o -path '*/.jj/repo/op_store' \) -prune -o \
       \( -name .git -o -path '*/.git/hooks*' -o -path '*/.git/config*' \
+         -o -path '*/.git/commondir' -o -path '*/.git/modules/*/commondir' \
          -o -path '*/.git/modules/*/config' -o -path '*/.git/modules/*/hooks*' \
          -o -path '*/.git/worktrees/*/config*' \
          -o -name .jj -o -path '*/.jj/repo' -o -path '*/.jj/repo/config.toml' \
-         -o -path '*/.jj/repo/store/git/config' -o -path '*/.jj/repo/store/git/hooks*' \) \
+         -o -path '*/.jj/repo/config-id' -o -path '*/.jj/repo/store/git_target' \
+         -o -path '*/.jj/repo/store/git/config' -o -path '*/.jj/repo/store/git/hooks*' \
+         -o -path '*/.jj/repo/store/git/commondir' \) \
       ! -name '*.sample' -print 2>/dev/null)   # git never runs *.sample hooks
   if ((${#files[@]})); then
     shasum -a 256 "${files[@]}" | awk '{h=$1; sub(/^[^ ]+ [ *]/, ""); print $0 "\t" h}'
@@ -157,23 +162,81 @@ guard_check() {
   printf '%s\n' "$changes" >&2
 }
 
-readonly_mounts() {  # appends to the caller's `args`
-  local w="$WORKSPACE"
-  if [[ -d $w/.git && ! -L $w/.git ]]; then
-    [[ -e $w/.git/hooks || -L $w/.git/hooks ]] || mkdir "$w/.git/hooks"
-    if [[ -d $w/.git/hooks && ! -L $w/.git/hooks ]]; then args+=(-v "$w/.git/hooks:$w/.git/hooks:ro"); fi
-    if [[ -f $w/.git/config && ! -L $w/.git/config ]]; then args+=(-v "$w/.git/config:$w/.git/config:ro"); fi
+# A read-only mount alone isn't enough: rename(2) refuses to move a mount point
+# (EBUSY) but happily moves its parent, so `mv .git x && mkdir .git` would swap
+# in a repo with the agent's own hooks. Every dir between the workspace and a
+# protected file is therefore bind-mounted rw onto itself, which pins it.
+# Parents must come before children in `args`.
+# Catch: container mounts a single file by sharing its parent dir, and silently
+# drops a second mount of the same source dir. So `-v .git/config:..:ro` would
+# swallow the `.git` pin. Read-only files are therefore served from a per-run
+# copy in $STAGE, one dir each; it's read-only, so the copy can't diverge.
+is_dir() { [[ -d $1 && ! -L $1 ]]; }
+pin() { if is_dir "$1"; then args+=(-v "$1:$1"); fi; }
+ro() {
+  if is_dir "$1"; then args+=(-v "$1:$1:ro")
+  elif [[ -f $1 && ! -L $1 ]]; then
+    local d="$STAGE/$((++STAGE_N))"
+    mkdir "$d" && cp -p "$1" "$d/" && args+=(-v "$d/$(basename "$1"):$1:ro")
   fi
-  local jjc="$w/.jj/repo/config.toml"
-  if [[ ! -L $w/.jj && ! -L $w/.jj/repo && -f $jjc && ! -L $jjc ]]; then args+=(-v "$jjc:$jjc:ro"); fi
+}
+ensure_file() { [[ -e $1 || -L $1 ]] || : > "$1"; }
+ensure_dir()  { [[ -e $1 || -L $1 ]] || mkdir "$1"; }
+
+# Files whose mere presence redirects git to another config/hooks dir, and
+# that can't be pinned because they normally don't exist.
+COMMONDIRS=(.git/commondir .jj/repo/store/git/commondir)
+
+readonly_mounts() {  # appends to the caller's `args`
+  local w="$WORKSPACE" r="$WORKSPACE/.jj/repo"
+  if is_dir "$w/.git"; then
+    ensure_dir "$w/.git/hooks"
+    pin "$w/.git"; ro "$w/.git/hooks"; ro "$w/.git/config"
+  fi
+  if is_dir "$w/.jj"; then
+    pin "$w/.jj"
+    if is_dir "$r"; then
+      ensure_file "$r/config.toml"   # jj reads (and migrates) this if it appears
+      pin "$r"; ro "$r/config.toml"; ro "$r/config-id"
+      if is_dir "$r/store"; then
+        pin "$r/store"; ro "$r/store/git_target"   # jj runs `git` against this dir
+        if is_dir "$r/store/git"; then          # non-colocated: jj's internal git repo
+          ensure_dir "$r/store/git/hooks"
+          pin "$r/store/git"; ro "$r/store/git/hooks"; ro "$r/store/git/config"
+        fi
+      fi
+    else
+      ro "$r"   # a file: secondary jj workspace pointing at its repo
+    fi
+  fi
+}
+
+check_commondirs() {
+  local c
+  for c in "${COMMONDIRS[@]}"; do
+    [[ -e $WORKSPACE/$c || -L $WORKSPACE/$c ]] && die "$WORKSPACE/$c exists: it redirects git's config and hooks elsewhere. Inspect and remove it first."
+  done
+  return 0
+}
+
+quarantine_commondirs() {
+  local c
+  for c in "${COMMONDIRS[@]}"; do
+    if [[ -e $WORKSPACE/$c || -L $WORKSPACE/$c ]]; then
+      mv -f "$WORKSPACE/$c" "$WORKSPACE/$c.agentbox-quarantine"
+      warn "the agent created $c (redirects git config/hooks); moved it to $c.agentbox-quarantine"
+    fi
+  done
 }
 
 on_exit() {
   # If we're killed (e.g. terminal closed -> SIGHUP), remove the VM: --rm only
   # fires when the container exits on its own, not when the CLI client dies.
   container rm -f "$BOX_NAME" >/dev/null 2>&1 || true
+  [[ -n ${STAGE:-} ]] && rm -rf "$STAGE"
   sync_home_back || true
   guard_check || true
+  quarantine_commondirs || true
 }
 
 run_in_box() {
@@ -181,10 +244,10 @@ run_in_box() {
   ensure_system
   container image inspect "$IMAGE" >/dev/null 2>&1 || cmd_build
   prepare_home
+  check_commondirs
 
   # Globals on purpose: the EXIT trap runs after this function returns, when locals are gone.
   BOX_NAME="agentbox-$(basename "$WORKSPACE" | tr -c 'a-zA-Z0-9-\n' '-')-$$"
-  GUARD_BEFORE="$(guard_snapshot)"
   local args=(run --rm --name "$BOX_NAME" --label agentbox=1 --progress none
     --init                              # real PID 1: forwards signals, reaps zombies
     --cap-drop ALL                      # agent needs no Linux capabilities
@@ -193,7 +256,10 @@ run_in_box() {
     -v "$AGENT_HOME:/home/agent"        # this project's own persistent agent home
     -w "$WORKSPACE"
     -e TERM="${TERM:-xterm-256color}")
+  STAGE="$DATA/run/$BOX_NAME" STAGE_N=0
+  (umask 077; rm -rf "$STAGE"; mkdir -p "$STAGE")
   readonly_mounts                       # must come after the workspace mount
+  GUARD_BEFORE="$(guard_snapshot)"      # after readonly_mounts: it may create hooks/, config.toml
   local k v
   for k in NAME EMAIL; do
     v="$(git config "user.$(tr '[:upper:]' '[:lower:]' <<<"$k")" 2>/dev/null || true)"

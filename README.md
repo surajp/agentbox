@@ -77,7 +77,12 @@ network blocks public DNS, point `AGENTBOX_DNS` at your LAN resolver in your she
   can't push. Your git name and email are passed in so its commits are attributed to you.
 - **Host-execution guard.** git hooks and repo config (`core.fsmonitor`, `core.hooksPath`, ...) and
   jj repo config run *on your Mac* the next time you use git/jj there. So `.git/hooks`, `.git/config`
-  and `.jj/repo/config.toml` are mounted read-only. This means the agent can't run `git config`,
+  `.jj/repo/config.toml` and `.jj/repo/store/git_target` are mounted read-only. Their parent
+  directories (`.git`, `.jj`, `.jj/repo`, ...) are bind-mounted onto themselves so the agent can't
+  rename them away and drop in a replacement. If the agent creates a `.git/commondir` (which points
+  git at a different config and hooks directory), agentbox moves it aside on exit, and it refuses
+  to start while one exists. If `.jj/repo/config.toml` is missing, agentbox creates an empty one
+  first, so jj prints a one-time "config file has been migrated" note on the host. This means the agent can't run `git config`,
   `git remote add` or `git push -u`. agentbox also snapshots nested repos, submodules and
   worktrees, and prints a red warning on exit listing any hook or config that changed.
   The check runs after the session ends, so don't run git inside nested repos on the host while a
